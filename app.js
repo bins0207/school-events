@@ -1,0 +1,750 @@
+'use strict';
+/* 학교 행사 참여 기록 — 프런트엔드 (설치·빌드 없이 동작하는 단일 스크립트) */
+
+const CFG = window.APP_CONFIG || {};
+const API_URL = String(CFG.API_URL || '').trim();
+const GAS = typeof google !== 'undefined' && google.script && google.script.run; // 구글 Apps Script 안에서 실행 중
+const DEMO = !API_URL && !GAS;
+const SCHOOL = CFG.SCHOOL_NAME || '우리 학교';
+const CATS = ['자율', '동아리', '봉사', '진로', '종합', '수상', '기타'];
+const EV_FIELDS = ['id','학년도','행사명','분류','대상','학년','시작일','종료일','주관부서','활동내용','생기부문구','비고','수정자','수정일시'];
+
+const S = {
+  user: '', code: '', role: null, year: '', tab: 'students',
+  db: { events: [], students: [], parts: [] },
+  f: { grade: '', cls: '', q: '', cat: '' },     // 학생 조회 필터
+  sel: null,                                      // 선택한 학생 key
+  ef: { q: '', cat: '', dept: '' },               // 행사 필터
+  edit: null,                                     // 편집 중인 행사
+};
+let IX = null;
+
+/* ---------- 작은 도구들 ---------- */
+const $ = (s, el = document) => el.querySelector(s);
+const $$ = (s, el = document) => [...el.querySelectorAll(s)];
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const store = {
+  get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} },
+  del(k) { try { localStorage.removeItem(k); } catch (e) {} },
+};
+const numSort = (a, b) => String(a).localeCompare(String(b), 'ko', { numeric: true });
+const byStu = (a, b) => numSort(a.학번, b.학번);
+const byDate = (a, b) => (a.시작일 || '9999').localeCompare(b.시작일 || '9999') || numSort(a.행사명, b.행사명);
+const uniq = a => [...new Set(a)];
+
+function toast(msg, bad) {
+  const t = $('#toast');
+  t.textContent = msg; t.className = 'show' + (bad ? ' bad' : '');
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.className = '', bad ? 4500 : 2200);
+}
+function busy(on, msg = '저장 중…') {
+  let b = $('.busy');
+  if (on && !b) { b = document.createElement('div'); b.className = 'busy'; b.textContent = msg; document.body.append(b); }
+  if (!on && b) b.remove();
+}
+function normDate(v) {
+  v = String(v ?? '').trim();
+  if (!v) return '';
+  if (/^\d{5}$/.test(v)) { // 엑셀 날짜 일련번호
+    const d = new Date(Date.UTC(1899, 11, 30) + Number(v) * 864e5);
+    return d.toISOString().slice(0, 10);
+  }
+  const m = v.match(/(\d{4})\D+(\d{1,2})\D+(\d{1,2})/);
+  return m ? `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}` : v;
+}
+const fmtD = d => d ? d.replace(/-/g, '.') : '';
+const period = e => fmtD(e.시작일) + (e.종료일 && e.종료일 !== e.시작일 ? ' ~ ' + fmtD(e.종료일) : '');
+function schoolYearOf(d) {
+  const m = String(d || '').match(/^(\d{4})-(\d{2})/);
+  if (!m) return '';
+  return String(Number(m[2]) < 3 ? Number(m[1]) - 1 : Number(m[1]));
+}
+function curSchoolYear() {
+  const n = new Date();
+  return String(n.getMonth() < 2 ? n.getFullYear() - 1 : n.getFullYear());
+}
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); }
+  catch (e) {
+    const ta = document.createElement('textarea'); ta.value = text; document.body.append(ta);
+    ta.select(); document.execCommand('copy'); ta.remove();
+  }
+  toast('복사했습니다');
+}
+function download(name, text) {
+  const blob = new Blob(['﻿' + text], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+const csvCell = v => /[",\n\r]/.test(String(v ?? '')) ? '"' + String(v).replace(/"/g, '""') + '"' : String(v ?? '');
+const toCSV = rows => rows.map(r => r.map(csvCell).join(',')).join('\r\n');
+
+/** 엑셀에서 복사한 표(탭 구분) 또는 CSV를 읽기. 따옴표 안 줄바꿈도 처리 */
+function parseTable(text) {
+  text = String(text || '').replace(/\r\n?/g, '\n');
+  const first = text.split('\n')[0] || '';
+  const sep = first.includes('\t') ? '\t' : ',';
+  const rows = []; let row = [], cell = '', q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else q = false; }
+      else cell += c;
+    } else if (c === '"' && cell === '') q = true;
+    else if (c === sep) { row.push(cell); cell = ''; }
+    else if (c === '\n') { row.push(cell); rows.push(row); row = []; cell = ''; }
+    else cell += c;
+  }
+  if (cell !== '' || row.length) { row.push(cell); rows.push(row); }
+  return rows.map(r => r.map(c => c.trim())).filter(r => r.some(Boolean));
+}
+
+/* ---------- 데이터 색인 ---------- */
+function buildIndex() {
+  const { events, students, parts } = S.db;
+  const stuByKey = new Map(students.map(s => [s.학년도 + '|' + s.학번, s]));
+  const partsByEv = new Map();
+  parts.forEach(p => {
+    if (!partsByEv.has(p.행사id)) partsByEv.set(p.행사id, new Set());
+    partsByEv.get(p.행사id).add(p.학번);
+  });
+  const years = uniq([...events.map(e => e.학년도), ...students.map(s => s.학년도)].filter(Boolean)).sort().reverse();
+  IX = { stuByKey, partsByEv, years };
+  if (!S.year || !years.includes(S.year)) S.year = years[0] || curSchoolYear();
+}
+const skey = s => s.학년도 + '|' + s.학번;
+const yearStudents = y => S.db.students.filter(s => s.학년도 === String(y)).sort(byStu);
+const yearEvents = y => S.db.events.filter(e => e.학년도 === String(y)).sort(byDate);
+const gradesOf = ev => String(ev.학년 || '').split(/[^0-9]+/).filter(Boolean);
+const isAll = ev => String(ev.대상 || '').trim() === '전체';
+function includes(ev, st) {
+  if (ev.학년도 !== st.학년도) return false;
+  if (isAll(ev)) { const g = gradesOf(ev); return !g.length || g.includes(String(st.학년)); }
+  return !!IX.partsByEv.get(ev.id)?.has(st.학번);
+}
+function participants(ev) {
+  if (isAll(ev)) return yearStudents(ev.학년도).filter(s => includes(ev, s));
+  return [...(IX.partsByEv.get(ev.id) || [])]
+    .map(h => IX.stuByKey.get(ev.학년도 + '|' + h) || { 학년도: ev.학년도, 학번: h, 이름: '(명단에 없음)', missing: true })
+    .sort(byStu);
+}
+const partCount = ev => isAll(ev) ? participants(ev).length : (IX.partsByEv.get(ev.id)?.size || 0);
+const studentEvents = st => yearEvents(st.학년도).filter(e => includes(e, st));
+const stuLabel = s => s.missing ? `${s.학번} ${s.이름}` : `${s.학년}학년 ${s.반}반 ${s.번호}번 ${s.이름}`;
+const targetLabel = e => (gradesOf(e).length ? gradesOf(e).join('·') + '학년 ' : '') + (e.대상 || '선택');
+
+/* ---------- 서버 통신 ---------- */
+async function call(action, payload = {}) {
+  const body = { action, code: S.code, user: S.user, ...payload };
+  if (DEMO) return Demo.call(body);
+  if (GAS) return new Promise((resolve, reject) => {
+    google.script.run
+      .withSuccessHandler(txt => { const j = JSON.parse(txt); j.ok ? resolve(j) : reject(new Error(j.error || '오류가 발생했습니다.')); })
+      .withFailureHandler(e => reject(new Error((e && e.message) || '서버 오류가 발생했습니다.')))
+      .api(body);
+  });
+  let res;
+  try {
+    res = await fetch(API_URL, { method: 'POST', body: JSON.stringify(body) }); // text/plain → CORS 사전요청 없음
+  } catch (e) { throw new Error('서버에 연결할 수 없습니다. 인터넷 연결이나 API 주소를 확인하세요.'); }
+  const j = await res.json().catch(() => ({ ok: false, error: '서버 응답을 읽을 수 없습니다.' }));
+  if (!j.ok) throw new Error(j.error || '오류가 발생했습니다.');
+  return j;
+}
+async function reload() {
+  const r = await call('load');
+  S.role = r.role;
+  S.db = { events: r.events || [], students: r.students || [], parts: r.parts || [] };
+  buildIndex();
+}
+
+/* ---------- 로그인 ---------- */
+function renderLogin(err = '') {
+  const saved = store.get('login') || {};
+  $('#app').innerHTML = `
+    ${DEMO ? '<div class="demo-bar">체험 모드 — 예시 데이터로 동작합니다. 입력한 내용은 이 브라우저에만 저장됩니다.</div>' : ''}
+    <form class="card login" id="loginForm">
+      <h2>학교 행사 참여 기록</h2>
+      <div class="muted small">${esc(SCHOOL)}</div>
+      <label for="lgName">이름</label>
+      <input type="text" id="lgName" value="${esc(S.user || saved.user || '')}" placeholder="예: 김선생" autocomplete="name" required>
+      <label for="lgCode">접속 코드</label>
+      <input type="password" id="lgCode" placeholder="조회 코드 또는 편집 코드" required>
+      ${DEMO ? '<div class="muted small" style="margin-top:6px">체험용 코드: 편집 <code>edit</code> · 조회 <code>view</code></div>' : ''}
+      <label class="row small" style="font-weight:400"><input type="checkbox" id="lgKeep" ${saved.code ? 'checked' : ''}> 이 기기에서 로그인 유지</label>
+      <button class="btn pri" type="submit">들어가기</button>
+      <div class="err">${esc(err)}</div>
+    </form>`;
+  $('#loginForm').onsubmit = async ev => {
+    ev.preventDefault();
+    S.user = $('#lgName').value.trim();
+    S.code = $('#lgCode').value.trim();
+    const btn = $('#loginForm button'); btn.disabled = true; btn.textContent = '확인 중…';
+    try {
+      await reload();
+      store.set('login', { user: S.user, code: $('#lgKeep').checked ? S.code : '' });
+      renderApp();
+    } catch (e) { renderLogin(e.message); }
+  };
+}
+function logout() {
+  const s = store.get('login') || {};
+  store.set('login', { user: s.user });
+  S.code = ''; S.role = null; renderLogin();
+}
+
+/* ---------- 앱 틀 ---------- */
+function renderApp() {
+  const canEdit = S.role === 'edit';
+  const years = uniq([...IX.years, S.year]).sort().reverse();
+  $('#app').innerHTML = `
+    ${DEMO ? '<div class="demo-bar">체험 모드 — 예시 데이터입니다. 실제 사용은 README의 설치 방법을 따라 주세요.</div>' : ''}
+    <header class="top"><div class="top-in">
+      <div class="brand">행사 참여 기록<small>${esc(SCHOOL)}</small></div>
+      <select id="yearSel" aria-label="학년도">${years.map(y => `<option value="${y}" ${y === S.year ? 'selected' : ''}>${y}학년도</option>`).join('')}</select>
+      <nav class="tabs">
+        ${[['students', '학생별 조회'], ['events', '행사 관리'], ['data', '명단·가져오기']]
+          .map(([k, t]) => `<button class="tab ${S.tab === k ? 'on' : ''}" data-tab="${k}">${t}</button>`).join('')}
+      </nav>
+      <div class="spacer"></div>
+      <div class="who">${esc(S.user)} <span class="role ${canEdit ? 'edit' : ''}">${canEdit ? '편집' : '조회'}</span>
+        <button class="btn sm" id="refreshBtn" title="다른 선생님이 바꾼 내용 불러오기">새로고침</button>
+        <button class="btn sm" id="logoutBtn">나가기</button></div>
+    </div></header>
+    <main id="main"></main>`;
+  $('#yearSel').onchange = e => { S.year = e.target.value; S.sel = null; S.f.grade = S.f.cls = ''; renderTab(); };
+  $$('.tab').forEach(b => b.onclick = () => { S.tab = b.dataset.tab; renderApp(); });
+  $('#logoutBtn').onclick = logout;
+  $('#refreshBtn').onclick = async () => {
+    busy(true, '불러오는 중…');
+    try { await reload(); renderApp(); toast('최신 내용으로 바꿨습니다'); } catch (e) { toast(e.message, true); }
+    busy(false);
+  };
+  renderTab();
+}
+function renderTab() {
+  ({ students: renderStudents, events: renderEvents, data: renderData })[S.tab]();
+}
+
+/* ========== 1. 학생별 조회 ========== */
+function renderStudents() {
+  const studs = yearStudents(S.year);
+  const grades = uniq(studs.map(s => s.학년)).sort(numSort);
+  if (S.f.grade && !grades.includes(S.f.grade)) S.f.grade = '';
+  const classes = uniq(studs.filter(s => !S.f.grade || s.학년 === S.f.grade).map(s => s.반)).sort(numSort);
+  if (S.f.cls && !classes.includes(S.f.cls)) S.f.cls = '';
+  $('#main').innerHTML = `
+    <div class="split">
+      <aside class="card side">
+        <div class="ctl">
+          <select id="fGrade"><option value="">전체 학년</option>${grades.map(g => `<option ${g === S.f.grade ? 'selected' : ''} value="${g}">${g}학년</option>`).join('')}</select>
+          <select id="fCls"><option value="">전체 반</option>${classes.map(c => `<option ${c === S.f.cls ? 'selected' : ''} value="${c}">${c}반</option>`).join('')}</select>
+          <input type="search" id="fQ" placeholder="이름 또는 학번 검색" value="${esc(S.f.q)}">
+        </div>
+        <div class="stu-list" id="stuList"></div>
+        <div class="side-foot">
+          <button class="btn sm" id="classPrint" ${S.f.cls ? '' : 'disabled title="학년과 반을 먼저 고르세요"'}>반 전체 인쇄</button>
+          <button class="btn sm" id="classCsv" ${S.f.cls ? '' : 'disabled title="학년과 반을 먼저 고르세요"'}>반 전체 엑셀(CSV)</button>
+        </div>
+      </aside>
+      <section id="detail"></section>
+    </div>`;
+  $('#fGrade').onchange = e => { S.f.grade = e.target.value; S.f.cls = ''; renderStudents(); };
+  $('#fCls').onchange = e => { S.f.cls = e.target.value; renderStudents(); };
+  $('#fQ').oninput = e => { S.f.q = e.target.value; renderStuList(); };
+  $('#classPrint').onclick = () => printStudents(filteredStudents());
+  $('#classCsv').onclick = () => classCsv(filteredStudents());
+  renderStuList();
+  renderDetail();
+}
+function filteredStudents() {
+  const q = S.f.q.trim();
+  return yearStudents(S.year).filter(s =>
+    (!S.f.grade || s.학년 === S.f.grade) && (!S.f.cls || s.반 === S.f.cls) &&
+    (!q || s.이름.includes(q) || s.학번.includes(q)));
+}
+function renderStuList() {
+  const list = filteredStudents();
+  const el = $('#stuList');
+  if (!yearStudents(S.year).length) {
+    el.innerHTML = `<div class="empty small">${S.year}학년도 학생 명단이 없습니다.<br>'명단·가져오기'에서 올려 주세요.</div>`;
+    return;
+  }
+  el.innerHTML = list.slice(0, 600).map(s => `
+    <button class="stu ${S.sel === skey(s) ? 'on' : ''}" data-k="${esc(skey(s))}">
+      <span class="no">${esc(s.학번)}</span><span class="nm">${esc(s.이름)}</span>
+      <span class="cnt">${studentEvents(s).length}</span>
+    </button>`).join('') || '<div class="empty small">검색 결과가 없습니다.</div>';
+  $$('.stu', el).forEach(b => b.onclick = () => {
+    S.sel = b.dataset.k; S.f.cat = '';
+    $$('.stu', el).forEach(x => x.classList.toggle('on', x === b));
+    renderDetail();
+    if (innerWidth < 860) $('#detail').scrollIntoView({ behavior: 'smooth' });
+  });
+}
+function renderDetail() {
+  const el = $('#detail');
+  const st = S.sel && IX.stuByKey.get(S.sel);
+  if (!st || st.학년도 !== S.year) {
+    el.innerHTML = `<div class="card empty">목록에서 학생을 고르면 참여한 행사가 나타납니다.</div>`;
+    return;
+  }
+  const evs = studentEvents(st);
+  const cats = uniq(evs.map(e => e.분류).filter(Boolean));
+  const shown = evs.filter(e => !S.f.cat || e.분류 === S.f.cat);
+  el.innerHTML = `
+    <div class="card">
+      <div class="d-head">
+        <div style="flex:1">
+          <div class="muted small">${esc(st.학년도)}학년도 · 학번 ${esc(st.학번)}</div>
+          <div class="nm">${esc(st.학년)}학년 ${esc(st.반)}반 ${esc(st.번호)}번 ${esc(st.이름)}</div>
+          <div class="muted small">참여 행사 ${evs.length}건</div>
+        </div>
+        <button class="btn" id="copyAll" ${evs.some(e => e.생기부문구) ? '' : 'disabled'}>생기부 문구 모두 복사</button>
+        <button class="btn" id="printOne">인쇄</button>
+      </div>
+      <div class="chips">
+        <button class="chip ${!S.f.cat ? 'on' : ''}" data-cat="">전체 ${evs.length}</button>
+        ${cats.map(c => `<button class="chip ${S.f.cat === c ? 'on' : ''}" data-cat="${esc(c)}">${esc(c)} ${evs.filter(e => e.분류 === c).length}</button>`).join('')}
+      </div>
+      ${shown.map((e, i) => `
+        <div class="ev">
+          <div class="ev-top">
+            <span class="ev-date">${esc(period(e))}</span>
+            <span class="ev-name">${esc(e.행사명)}</span>
+            ${e.분류 ? `<span class="badge b-${esc(e.분류)}">${esc(e.분류)}</span>` : ''}
+            <span class="badge">${esc(targetLabel(e))}</span>
+            <span class="muted small">${esc(e.주관부서)}</span>
+          </div>
+          ${e.생기부문구 ? `<div class="memo"><button class="btn sm" data-copy="${i}">복사</button>${esc(e.생기부문구)}</div>` : ''}
+          ${e.활동내용 ? `<details><summary>활동 내용</summary><div class="txt">${esc(e.활동내용)}</div></details>` : ''}
+        </div>`).join('') || '<div class="empty">참여한 행사가 없습니다.</div>'}
+    </div>`;
+  $$('.chip', el).forEach(c => c.onclick = () => { S.f.cat = c.dataset.cat; renderDetail(); });
+  $$('[data-copy]', el).forEach(b => b.onclick = () => copyText(shown[b.dataset.copy].생기부문구));
+  $('#copyAll').onclick = () => copyText(shown.filter(e => e.생기부문구).map(e => `[${e.행사명} ${period(e)}]\n${e.생기부문구}`).join('\n\n'));
+  $('#printOne').onclick = () => printStudents([st]);
+}
+function printStudents(list) {
+  if (!list.length) return toast('인쇄할 학생이 없습니다', true);
+  $('#print').innerHTML = list.map(st => {
+    const evs = studentEvents(st);
+    return `<div class="p-page">
+      <h1>${esc(st.학년도)}학년도 창의적 체험활동 참여 기록</h1>
+      <p>${esc(st.학년)}학년 ${esc(st.반)}반 ${esc(st.번호)}번 ${esc(st.이름)} (학번 ${esc(st.학번)}) · 참여 ${evs.length}건</p>
+      <table><thead><tr><th>#</th><th>행사명</th><th>분류</th><th>기간</th><th>주관</th><th>생기부 문구</th></tr></thead><tbody>
+      ${evs.map((e, i) => `<tr><td>${i + 1}</td><td>${esc(e.행사명)}</td><td>${esc(e.분류)}</td><td>${esc(period(e))}</td><td>${esc(e.주관부서)}</td><td style="white-space:pre-wrap">${esc(e.생기부문구)}</td></tr>`).join('')}
+      </tbody></table></div>`;
+  }).join('');
+  window.print();
+}
+function classCsv(list) {
+  const rows = [['학번', '학년', '반', '번호', '이름', '행사명', '분류', '대상', '시작일', '종료일', '주관부서', '생기부문구']];
+  list.forEach(st => studentEvents(st).forEach(e =>
+    rows.push([st.학번, st.학년, st.반, st.번호, st.이름, e.행사명, e.분류, targetLabel(e), e.시작일, e.종료일, e.주관부서, e.생기부문구])));
+  download(`${S.year}_${S.f.grade}학년${S.f.cls}반_행사참여.csv`, toCSV(rows));
+}
+
+/* ========== 2. 행사 관리 ========== */
+function renderEvents() {
+  const canEdit = S.role === 'edit';
+  const evs = yearEvents(S.year);
+  const depts = uniq(evs.map(e => e.주관부서).filter(Boolean)).sort();
+  const cats = uniq([...CATS, ...evs.map(e => e.분류).filter(Boolean)]);
+  $('#main').innerHTML = `
+    <div class="card">
+      <div class="toolbar">
+        <input type="search" id="eQ" placeholder="행사명 검색" value="${esc(S.ef.q)}">
+        <select id="eCat"><option value="">모든 분류</option>${cats.map(c => `<option ${c === S.ef.cat ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>
+        <select id="eDept"><option value="">모든 주관부서</option>${depts.map(c => `<option ${c === S.ef.dept ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>
+        <button class="btn" id="eCsv">목록 엑셀(CSV)</button>
+        ${canEdit ? '<button class="btn pri" id="eNew">+ 새 행사</button>' : ''}
+      </div>
+      <div class="tbl-wrap"><table>
+        <thead><tr><th>기간</th><th>행사명</th><th>분류</th><th>대상</th><th>주관부서</th><th class="num">참여</th><th>최근 수정</th></tr></thead>
+        <tbody id="eBody"></tbody>
+      </table></div>
+    </div>`;
+  const draw = () => {
+    const q = S.ef.q.trim();
+    const list = evs.filter(e => (!q || e.행사명.includes(q)) && (!S.ef.cat || e.분류 === S.ef.cat) && (!S.ef.dept || e.주관부서 === S.ef.dept));
+    $('#eBody').innerHTML = list.map(e => `
+      <tr class="click" data-id="${esc(e.id)}">
+        <td class="small" style="white-space:nowrap">${esc(period(e))}</td>
+        <td><b>${esc(e.행사명)}</b></td>
+        <td>${e.분류 ? `<span class="badge b-${esc(e.분류)}">${esc(e.분류)}</span>` : ''}</td>
+        <td class="small">${esc(targetLabel(e))}</td>
+        <td class="small">${esc(e.주관부서)}</td>
+        <td class="num">${partCount(e)}명</td>
+        <td class="small muted">${esc(e.수정자)}${e.수정일시 ? '<br>' + esc(e.수정일시) : ''}</td>
+      </tr>`).join('') || `<tr><td colspan="7" class="empty">${S.year}학년도 행사가 없습니다.</td></tr>`;
+    $$('#eBody tr.click').forEach(tr => tr.onclick = () => openEvent(S.db.events.find(e => e.id === tr.dataset.id)));
+  };
+  $('#eQ').oninput = e => { S.ef.q = e.target.value; draw(); };
+  $('#eCat').onchange = e => { S.ef.cat = e.target.value; draw(); };
+  $('#eDept').onchange = e => { S.ef.dept = e.target.value; draw(); };
+  $('#eCsv').onclick = () => download(`${S.year}_행사목록.csv`, toCSV([
+    ['행사명', '분류', '대상', '학년', '시작일', '종료일', '주관부서', '참여인원', '활동내용', '생기부문구', '비고'],
+    ...evs.map(e => [e.행사명, e.분류, e.대상, e.학년, e.시작일, e.종료일, e.주관부서, partCount(e), e.활동내용, e.생기부문구, e.비고])]));
+  if (canEdit) $('#eNew').onclick = () => openEvent(null);
+  draw();
+}
+
+function openEvent(ev) {
+  const canEdit = S.role === 'edit';
+  const isNew = !ev;
+  ev = ev ? { ...ev } : { 학년도: S.year, 대상: '선택', 분류: '자율', 학년: '' };
+  S.edit = { ev, sel: new Set(isAll(ev) ? [] : [...(IX.partsByEv.get(ev.id) || [])]), pg: '', pc: '', hadParts: !!IX.partsByEv.get(ev.id)?.size };
+  const depts = uniq(S.db.events.map(e => e.주관부서).filter(Boolean)).sort();
+  const dis = canEdit ? '' : 'disabled';
+  const allGrades = uniq(['1', '2', '3', ...yearStudents(ev.학년도).map(s => s.학년)]).sort(numSort);
+  const g = gradesOf(ev);
+  const dlg = $('#dlg');
+  dlg.innerHTML = `
+    <div class="dlg-h"><h2>${isNew ? '새 행사' : esc(ev.행사명)}</h2><button class="btn sm" data-close>닫기</button></div>
+    <div class="dlg-b">
+      <div class="form" id="evForm">
+        <label class="s2">행사명 *<input type="text" name="행사명" value="${esc(ev.행사명)}" ${dis}></label>
+        <label>분류<input type="text" name="분류" list="catList" value="${esc(ev.분류)}" ${dis}></label>
+        <label>학년도<input type="number" name="학년도" value="${esc(ev.학년도)}" ${dis}></label>
+        <label>시작일<input type="date" name="시작일" value="${esc(ev.시작일)}" ${dis}></label>
+        <label>종료일<input type="date" name="종료일" value="${esc(ev.종료일)}" ${dis}></label>
+        <label class="s2">주관부서<input type="text" name="주관부서" list="deptList" value="${esc(ev.주관부서)}" ${dis}></label>
+        <label class="s2">대상
+          <div class="checks">
+            <label class="row"><input type="radio" name="대상" value="선택" ${!isAll(ev) ? 'checked' : ''} ${dis}> 참여 학생만 (명단 등록)</label>
+            <label class="row"><input type="radio" name="대상" value="전체" ${isAll(ev) ? 'checked' : ''} ${dis}> 전체 학생</label>
+          </div></label>
+        <label class="s2">해당 학년 <span class="muted" style="font-weight:400">(아무것도 안 고르면 전 학년)</span>
+          <div class="checks">${allGrades.map(x => `<label class="row"><input type="checkbox" name="학년" value="${x}" ${g.includes(x) ? 'checked' : ''} ${dis}> ${x}학년</label>`).join('')}</div></label>
+        <label class="s4">활동 내용<textarea name="활동내용" rows="3" ${dis}>${esc(ev.활동내용)}</textarea></label>
+        <label class="s4">생기부 공통 문구<textarea name="생기부문구" rows="3" ${dis}>${esc(ev.생기부문구)}</textarea></label>
+        <label class="s4">비고<input type="text" name="비고" value="${esc(ev.비고)}" ${dis}></label>
+      </div>
+      <datalist id="catList">${CATS.map(c => `<option value="${c}">`).join('')}</datalist>
+      <datalist id="deptList">${depts.map(c => `<option value="${esc(c)}">`).join('')}</datalist>
+      <div class="pp" id="pp"></div>
+      ${!isNew && ev.수정자 ? `<p class="muted small">최근 수정: ${esc(ev.수정자)} ${esc(ev.수정일시)}</p>` : ''}
+    </div>
+    <div class="dlg-f">
+      ${canEdit && !isNew ? '<button class="btn danger" id="evDel" style="margin-right:auto">행사 삭제</button>' : ''}
+      <button class="btn" data-close>${canEdit ? '취소' : '닫기'}</button>
+      ${canEdit ? '<button class="btn pri" id="evSave">저장</button>' : ''}
+    </div>`;
+  $$('[data-close]', dlg).forEach(b => b.onclick = () => dlg.close());
+  $$('#evForm input[name=대상], #evForm input[name=학년], #evForm input[name=학년도]', dlg).forEach(i => i.onchange = () => { readForm(); renderPP(); });
+  if (canEdit) {
+    $('#evSave').onclick = saveEvent;
+    if (!isNew) $('#evDel').onclick = deleteEvent;
+  }
+  renderPP();
+  if (!dlg.open) dlg.showModal();
+  dlg.scrollTop = 0;
+}
+function readForm() {
+  const f = $('#evForm'); const ev = S.edit.ev;
+  ['행사명', '분류', '학년도', '시작일', '종료일', '주관부서', '활동내용', '생기부문구', '비고'].forEach(k => ev[k] = f.querySelector(`[name="${k}"]`).value.trim());
+  ev.대상 = f.querySelector('[name=대상]:checked').value;
+  ev.학년 = $$('[name=학년]:checked', f).map(i => i.value).join(',');
+  if (!ev.학년도 && ev.시작일) ev.학년도 = schoolYearOf(ev.시작일);
+  return ev;
+}
+function renderPP() {
+  const E = S.edit, ev = E.ev, canEdit = S.role === 'edit';
+  const el = $('#pp');
+  const studs = yearStudents(ev.학년도 || S.year);
+  if (isAll(ev)) {
+    const n = studs.filter(s => includes({ ...ev, 학년도: String(ev.학년도) }, s)).length;
+    el.innerHTML = `<h3>참여 학생</h3><p class="muted">전체 대상 행사입니다. ${esc(ev.학년도)}학년도 ${gradesOf(ev).length ? gradesOf(ev).join('·') + '학년' : '전 학년'} 학생 <b>${n}명</b>이 자동으로 참여한 것으로 표시됩니다.</p>`;
+    return;
+  }
+  const grades = uniq(studs.map(s => s.학년)).sort(numSort);
+  if (!E.pg) E.pg = gradesOf(ev)[0] || grades[0] || '';
+  const classes = uniq(studs.filter(s => s.학년 === E.pg).map(s => s.반)).sort(numSort);
+  if (!classes.includes(E.pc)) E.pc = classes[0] || '';
+  const inCls = studs.filter(s => s.학년 === E.pg && s.반 === E.pc);
+  const selList = [...E.sel].map(h => IX.stuByKey.get(ev.학년도 + '|' + h) || { 학번: h, 이름: '명단에 없음', missing: true }).sort(byStu);
+  const missing = selList.filter(s => s.missing).length;
+
+  el.innerHTML = `
+    <h3>참여 학생 <span class="cnt">${E.sel.size}명</span></h3>
+    ${canEdit ? `
+    <div class="pp-grid">
+      <div>
+        <div class="row">
+          <select id="pg">${grades.map(x => `<option ${x === E.pg ? 'selected' : ''} value="${x}">${x}학년</option>`).join('')}</select>
+          <select id="pc">${classes.map(x => `<option ${x === E.pc ? 'selected' : ''} value="${x}">${x}반</option>`).join('')}</select>
+          <button class="btn sm" id="pAll">반 전체 선택</button>
+          <button class="btn sm" id="pNone">반 전체 해제</button>
+        </div>
+        <div class="pick" id="pick">${inCls.map(s => `
+          <label class="${E.sel.has(s.학번) ? 'on' : ''}"><input type="checkbox" value="${esc(s.학번)}" ${E.sel.has(s.학번) ? 'checked' : ''}>${esc(s.번호)}. ${esc(s.이름)}</label>`).join('')
+          || '<span class="muted small">이 학년도 학생 명단이 없습니다.</span>'}</div>
+      </div>
+      <div>
+        <div class="small muted">학번 붙여넣기 (엑셀에서 열을 복사해 붙여도 됩니다)</div>
+        <textarea id="pPaste" rows="5" placeholder="10107&#10;10123 10125&#10;…"></textarea>
+        <div class="row" style="margin-top:6px">
+          <button class="btn sm" id="pAdd">추가</button>
+          <button class="btn sm" id="pRemove">빼기</button>
+          <button class="btn sm danger" id="pClear" style="margin-left:auto">모두 지우기</button>
+        </div>
+      </div>
+    </div>` : ''}
+    ${missing ? `<p class="small" style="color:var(--bad)">명단에 없는 학번 ${missing}개가 있습니다. 학번을 확인하거나 학생 명단을 올려 주세요.</p>` : ''}
+    <div class="sel-list">${selList.map(s => `<span class="sel ${s.missing ? 'miss' : ''}" title="${esc(stuLabel(s))}">${esc(s.학번)} ${esc(s.이름)}${canEdit ? `<button data-rm="${esc(s.학번)}" aria-label="빼기">×</button>` : ''}</span>`).join('')
+      || '<span class="muted small">아직 등록된 학생이 없습니다.</span>'}</div>`;
+  if (!canEdit) return;
+  $('#pg').onchange = e => { E.pg = e.target.value; E.pc = ''; renderPP(); };
+  $('#pc').onchange = e => { E.pc = e.target.value; renderPP(); };
+  $$('#pick input').forEach(i => i.onchange = () => { i.checked ? E.sel.add(i.value) : E.sel.delete(i.value); renderPP(); });
+  $('#pAll').onclick = () => { inCls.forEach(s => E.sel.add(s.학번)); renderPP(); };
+  $('#pNone').onclick = () => { inCls.forEach(s => E.sel.delete(s.학번)); renderPP(); };
+  const pasted = () => (String($('#pPaste').value).match(/\d{4,6}/g) || []);
+  $('#pAdd').onclick = () => { const a = pasted(); a.forEach(h => E.sel.add(h)); toast(`${a.length}명 추가`); renderPP(); };
+  $('#pRemove').onclick = () => { const a = pasted(); a.forEach(h => E.sel.delete(h)); renderPP(); };
+  $('#pClear').onclick = () => { if (confirm('참여 학생을 모두 지울까요?')) { E.sel.clear(); renderPP(); } };
+  $$('[data-rm]', el).forEach(b => b.onclick = () => { E.sel.delete(b.dataset.rm); renderPP(); });
+}
+async function saveEvent() {
+  const ev = readForm();
+  if (!ev.행사명) return toast('행사명을 입력하세요', true);
+  if (ev.종료일 && ev.시작일 && ev.종료일 < ev.시작일) return toast('종료일이 시작일보다 빠릅니다', true);
+  busy(true);
+  try {
+    const payload = {}; EV_FIELDS.forEach(k => payload[k] = ev[k] ?? '');
+    const r = await call('saveEvent', { event: payload });
+    if (!isAll(ev)) await call('setParticipants', { eventId: r.event.id, ids: [...S.edit.sel] });
+    else if (S.edit.hadParts) await call('setParticipants', { eventId: r.event.id, ids: [] });
+    await reload();
+    S.year = String(ev.학년도 || S.year);
+    $('#dlg').close();
+    renderApp();
+    toast('저장했습니다');
+  } catch (e) { toast(e.message, true); }
+  busy(false);
+}
+async function deleteEvent() {
+  const ev = S.edit.ev;
+  if (!confirm(`'${ev.행사명}' 행사와 참여 명단을 삭제할까요? 되돌릴 수 없습니다.`)) return;
+  busy(true, '삭제 중…');
+  try {
+    await call('deleteEvent', { id: ev.id });
+    await reload(); $('#dlg').close(); renderApp(); toast('삭제했습니다');
+  } catch (e) { toast(e.message, true); }
+  busy(false);
+}
+
+/* ========== 3. 명단·가져오기 ========== */
+function renderData() {
+  const canEdit = S.role === 'edit';
+  const studs = yearStudents(S.year);
+  const grades = uniq(studs.map(s => s.학년)).sort(numSort);
+  const classes = uniq(studs.map(s => s.반)).sort(numSort);
+  const cnt = (g, c) => studs.filter(s => s.학년 === g && s.반 === c).length;
+  $('#main').innerHTML = `
+    <div class="grid2">
+      <div class="card">
+        <h2>${S.year}학년도 학생 명단 현황</h2>
+        ${studs.length ? `<div class="tbl-wrap"><table class="stat"><thead><tr><th>학년</th>${classes.map(c => `<th>${c}반</th>`).join('')}<th>합계</th></tr></thead><tbody>
+          ${grades.map(g => `<tr><th>${g}학년</th>${classes.map(c => `<td>${cnt(g, c) || ''}</td>`).join('')}<td><b>${studs.filter(s => s.학년 === g).length}</b></td></tr>`).join('')}
+          </tbody></table></div><p class="muted small">총 ${studs.length}명 · 행사 ${yearEvents(S.year).length}건</p>`
+          : '<p class="muted">아직 학생 명단이 없습니다.</p>'}
+        <p class="muted small">학번은 해마다 바뀌므로 학생 명단은 <b>학년도별로</b> 따로 보관됩니다. 새 학년도가 시작되면 그 해 명단을 새로 올리세요.</p>
+      </div>
+      <div class="card">
+        <h2>학생 명단 올리기</h2>
+        ${canEdit ? `
+        <p class="muted small">엑셀에서 <b>학번, 이름</b> 열을 복사해 붙여 넣으세요. (제목줄이 있으면 학년·반·번호 열도 인식합니다.) 학년·반·번호가 없으면 학번 <code>10107</code> → 1학년 1반 7번으로 계산합니다.</p>
+        <div class="row" style="margin-bottom:6px">
+          <label class="small">학년도 <input type="number" id="sYear" value="${esc(S.year)}" style="width:90px"></label>
+          <input type="file" id="sFile" accept=".csv,.tsv,.txt">
+        </div>
+        <textarea id="sPaste" rows="6" placeholder="학번&#9;이름&#10;10101&#9;홍길동&#10;10102&#9;김철수"></textarea>
+        <div class="preview" id="sPrev"></div>
+        <div class="row" style="margin-top:8px">
+          <label class="row small"><input type="radio" name="sMode" value="append" checked> 추가·고치기</label>
+          <label class="row small"><input type="radio" name="sMode" value="replaceYear"> 이 학년도 명단 전체 바꾸기</label>
+          <button class="btn pri" id="sGo" style="margin-left:auto" disabled>올리기</button>
+        </div>` : '<p class="muted">편집 코드로 접속하면 명단을 올릴 수 있습니다.</p>'}
+      </div>
+      ${canEdit ? `
+      <div class="card" style="grid-column:1/-1">
+        <h2>행사 여러 개 한꺼번에 가져오기</h2>
+        <p class="muted small">엑셀에서 <b>제목줄을 포함해</b> 복사해 붙여 넣으세요. 인식하는 제목: <code>행사명</code>(또는 내용) <code>분류</code> <code>대상</code>(전체/선택) <code>학년</code> <code>시작일</code> <code>종료일</code> <code>주관부서</code>(또는 주관) <code>활동내용</code> <code>생기부문구</code> <code>비고</code>. 참여 학생은 가져온 뒤 각 행사에서 등록합니다.</p>
+        <textarea id="ePaste" rows="6"></textarea>
+        <div class="preview" id="ePrev"></div>
+        <div class="row" style="margin-top:8px"><button class="btn pri" id="eGo" style="margin-left:auto" disabled>가져오기</button></div>
+      </div>` : ''}
+    </div>`;
+  if (!canEdit) return;
+
+  let sRows = [], eRows = [];
+  const sPrev = () => {
+    sRows = parseStudents($('#sPaste').value, $('#sYear').value.trim());
+    const bad = sRows.filter(r => !r.학번 || !r.이름).length;
+    $('#sPrev').innerHTML = sRows.length ? `<b>${sRows.length}명</b> 인식${bad ? ` · <span style="color:var(--bad)">학번/이름 빠진 줄 ${bad}개 (제외됨)</span>` : ''}
+      <table><tr><th>학번</th><th>학년</th><th>반</th><th>번호</th><th>이름</th></tr>${sRows.slice(0, 5).map(r => `<tr><td>${esc(r.학번)}</td><td>${esc(r.학년)}</td><td>${esc(r.반)}</td><td>${esc(r.번호)}</td><td>${esc(r.이름)}</td></tr>`).join('')}${sRows.length > 5 ? '<tr><td colspan="5">…</td></tr>' : ''}</table>` : '';
+    sRows = sRows.filter(r => r.학번 && r.이름);
+    $('#sGo').disabled = !sRows.length;
+  };
+  $('#sPaste').oninput = sPrev; $('#sYear').oninput = sPrev;
+  $('#sFile').onchange = async e => { const f = e.target.files[0]; if (f) { $('#sPaste').value = await readFileText(f); sPrev(); } };
+  $('#sGo').onclick = async () => {
+    const mode = $('[name=sMode]:checked').value;
+    const y = $('#sYear').value.trim();
+    if (mode === 'replaceYear' && !confirm(`${y}학년도 학생 명단을 이 ${sRows.length}명으로 전체 바꿀까요?`)) return;
+    busy(true, '올리는 중…');
+    try { await call('importRows', { table: 'students', rows: sRows, mode }); await reload(); S.year = y; renderApp(); toast(`${sRows.length}명 올렸습니다`); }
+    catch (err) { toast(err.message, true); }
+    busy(false);
+  };
+
+  $('#ePaste').oninput = () => {
+    try { eRows = parseEvents($('#ePaste').value); $('#ePrev').innerHTML = eRows.length ? `<b>${eRows.length}건</b> 인식: ${eRows.slice(0, 6).map(r => esc(r.행사명)).join(', ')}${eRows.length > 6 ? ' …' : ''}` : ''; }
+    catch (err) { eRows = []; $('#ePrev').innerHTML = `<span style="color:var(--bad)">${esc(err.message)}</span>`; }
+    $('#eGo').disabled = !eRows.length;
+  };
+  $('#eGo').onclick = async () => {
+    busy(true, '가져오는 중…');
+    try { await call('importRows', { table: 'events', rows: eRows, mode: 'append' }); await reload(); renderApp(); toast(`행사 ${eRows.length}건을 가져왔습니다`); }
+    catch (err) { toast(err.message, true); }
+    busy(false);
+  };
+}
+async function readFileText(f) {
+  const buf = await f.arrayBuffer();
+  let t = new TextDecoder('utf-8').decode(buf);
+  if (t.includes('�')) t = new TextDecoder('euc-kr').decode(buf); // 한글 엑셀 CSV
+  return t.replace(/^﻿/, '');
+}
+function parseStudents(text, year) {
+  const rows = parseTable(text);
+  if (!rows.length) return [];
+  const m = {};
+  const head = rows[0].map(c => c.replace(/\s/g, ''));
+  if (head.some(h => /학번|이름|성명/.test(h))) {
+    head.forEach((h, i) => {
+      if (/학번/.test(h)) m.hb = i; else if (/이름|성명/.test(h)) m.nm = i;
+      else if (/학년도/.test(h)) m.y = i; else if (/학년/.test(h)) m.g = i;
+      else if (/반/.test(h)) m.c = i; else if (/번호/.test(h)) m.n = i;
+    });
+    rows.shift();
+  } else {
+    const ncol = Math.max(...rows.map(r => r.length));
+    for (let i = 0; i < ncol; i++) {
+      const col = rows.map(r => r[i] || '');
+      if (m.hb === undefined && col.every(v => /^\d{4,6}$/.test(v))) m.hb = i;
+      else if (m.nm === undefined && col.every(v => /[가-힣a-zA-Z]/.test(v))) m.nm = i;
+    }
+  }
+  const n = v => v === undefined || v === '' ? '' : String(parseInt(v, 10) || v);
+  return rows.map(r => {
+    const hb = String(r[m.hb] ?? '').replace(/\D/g, '');
+    let g = n(r[m.g]), c = n(r[m.c]), no = n(r[m.n]);
+    if (hb.length === 5) { g = g || hb[0]; c = c || n(hb.slice(1, 3)); no = no || n(hb.slice(3)); }
+    else if (hb.length === 4) { g = g || hb[0]; c = c || hb[1]; no = no || n(hb.slice(2)); }
+    return { 학년도: String((m.y !== undefined && r[m.y]) || year), 학번: hb, 학년: g, 반: c, 번호: no, 이름: String(r[m.nm] ?? '').trim() };
+  });
+}
+function parseEvents(text) {
+  const rows = parseTable(text);
+  if (rows.length < 2) return [];
+  const alias = { 내용: '행사명', 행사: '행사명', 주관: '주관부서', 부서: '주관부서', '시작일': '시작일', '종료일': '종료일', 활동내용: '활동내용', 생기부공통문구: '생기부문구', 생기부문구: '생기부문구' };
+  const head = rows[0].map(h => { h = h.replace(/\s/g, ''); return alias[h] || h; });
+  if (!head.includes('행사명')) throw new Error('제목줄에 "행사명"(또는 "내용") 열이 필요합니다.');
+  return rows.slice(1).map(r => {
+    const o = {}; head.forEach((h, i) => { if (EV_FIELDS.includes(h)) o[h] = r[i] || ''; });
+    o.시작일 = normDate(o.시작일); o.종료일 = normDate(o.종료일);
+    o.대상 = /전체/.test(o.대상 || '') ? '전체' : '선택';
+    o.학년도 = o.학년도 || schoolYearOf(o.시작일) || S.year;
+    o.id = o.id || '';
+    return o;
+  }).filter(o => o.행사명);
+}
+
+/* ---------- 체험 모드 (API 주소가 없을 때) ---------- */
+const Demo = {
+  db: null,
+  load() { this.db = store.get('demo-db-v1') || makeDemoData(); },
+  save() { store.set('demo-db-v1', this.db); },
+  async call(b) {
+    if (!this.db) this.load();
+    await new Promise(r => setTimeout(r, 120));
+    const role = b.code === 'edit' ? 'edit' : b.code === 'view' ? 'view' : null;
+    if (!role) throw new Error('접속 코드가 올바르지 않습니다. (체험: edit 또는 view)');
+    if (b.action !== 'load' && role !== 'edit') throw new Error('편집 권한이 없습니다.');
+    const now = new Date().toISOString().slice(0, 16).replace('T', ' ');
+    const d = this.db;
+    switch (b.action) {
+      case 'load': return { ok: true, role, ...JSON.parse(JSON.stringify(d)) };
+      case 'saveEvent': {
+        const e = { ...b.event, 수정자: b.user, 수정일시: now };
+        if (!e.id) { e.id = e.학년도 + '-' + Math.random().toString(36).slice(2, 10); d.events.push(e); }
+        else { const i = d.events.findIndex(x => x.id === e.id); i >= 0 ? d.events[i] = e : d.events.push(e); }
+        this.save(); return { ok: true, role, event: e };
+      }
+      case 'deleteEvent':
+        d.events = d.events.filter(e => e.id !== b.id); d.parts = d.parts.filter(p => p.행사id !== b.id);
+        this.save(); return { ok: true, role };
+      case 'setParticipants': {
+        const prev = new Map(d.parts.filter(p => p.행사id === b.eventId).map(p => [p.학번, p]));
+        d.parts = d.parts.filter(p => p.행사id !== b.eventId);
+        uniq(b.ids).forEach(h => d.parts.push(prev.get(h) || { 행사id: b.eventId, 학번: h, 비고: '', 등록자: b.user, 등록일시: now }));
+        this.save(); return { ok: true, role };
+      }
+      case 'importRows': {
+        if (b.table === 'students') {
+          const ys = new Set(b.rows.map(r => r.학년도));
+          if (b.mode === 'replaceYear') d.students = d.students.filter(s => !ys.has(s.학년도));
+          const m = new Map(d.students.map((s, i) => [s.학년도 + '|' + s.학번, i]));
+          b.rows.forEach(r => { const k = r.학년도 + '|' + r.학번; m.has(k) ? d.students[m.get(k)] = r : (m.set(k, d.students.length), d.students.push(r)); });
+        } else if (b.table === 'events') {
+          b.rows.forEach(r => d.events.push({ ...r, id: r.id || r.학년도 + '-' + Math.random().toString(36).slice(2, 10), 수정자: b.user, 수정일시: now }));
+        }
+        this.save(); return { ok: true, role };
+      }
+    }
+    throw new Error('알 수 없는 요청');
+  },
+};
+function makeDemoData() {
+  let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  const pick = a => a[Math.floor(rnd() * a.length)];
+  const sur = '김이박최정강조윤장임한오서신권황안송류홍'.split('');
+  const giv = ['민준', '서연', '도윤', '하은', '시우', '지유', '주원', '서윤', '하준', '지민', '예준', '수아', '건우', '채원', '현우', '지아', '우진', '다은', '선우', '예린', '유찬', '소율', '은호', '하린'];
+  const Y = curSchoolYear(); const students = [];
+  for (let g = 1; g <= 3; g++) for (let c = 1; c <= 4; c++) for (let n = 1; n <= 24; n++)
+    students.push({ 학년도: Y, 학번: `${g}${String(c).padStart(2, '0')}${String(n).padStart(2, '0')}`, 학년: String(g), 반: String(c), 번호: String(n), 이름: pick(sur) + pick(giv) });
+  const ev = (name, cat, tgt, gr, s, e, dept, act, memo) => ({ id: Y + '-' + name.length + Math.floor(rnd() * 1e6), 학년도: Y, 행사명: name, 분류: cat, 대상: tgt, 학년: gr, 시작일: `${Y}-${s}`, 종료일: e ? `${Y}-${e}` : '', 주관부서: dept, 활동내용: act, 생기부문구: memo, 비고: '', 수정자: '예시', 수정일시: '' });
+  const events = [
+    ev('학교폭력예방 교육', '자율', '전체', '', '03-27', '', '학생생활안전부', '사이버폭력 예방 영상 시청 및 소감문 작성', '학교폭력예방 교육에 참여하여 사이버폭력의 유형과 대처 방법을 익힘.'),
+    ev('체육한마당', '자율', '전체', '', '05-04', '', '창의예술부', '학급 대항 체육대회', ''),
+    ev('선택과목 탐색의 날', '진로', '전체', '1', '05-11', '', '교육과정부', '고교학점제 개요, 선택과목 안내', '선택과목 탐색의 날에 참여하여 교과별 선택과목의 특성을 알아보고 진로와 연계한 학업 설계를 고민함.'),
+    ev('테마형 수학여행', '자율', '전체', '2', '05-16', '05-19', '2학년부', '국토의 지리적·역사적 의의 체험', ''),
+    ev('도서관 봄봄 독서 행사', '자율', '선택', '', '05-08', '05-12', '인문사회부', '독서록 작성, 신간도서 전시, 책갈피 만들기', '도서관 봄봄 독서 행사에 참여하여 독서록을 작성함.'),
+    ev('금융교육 특강', '진로', '선택', '', '07-12', '', '인문사회부', '은행의 역할과 직업, 금융 사기 예방', '금융교육 특강을 듣고 현명한 경제인이 되기 위한 태도를 배움.'),
+    ev('진로 탐색 캠프', '진로', '선택', '1,2', '08-20', '08-21', '진로진학부', '전공 체험 및 대학생 멘토링', ''),
+    ev('그린서포터즈 환경 활동', '봉사', '선택', '', '05-24', '11-30', '인문사회부', '교내 분리배출 캠페인', ''),
+    ev('학생기자단(2학기)', '종합', '선택', '', '09-01', '12-29', '1학년부', '학교 소식지 취재 및 기사 작성', ''),
+    ev('정보화 한마당', '수상', '선택', '', '05-24', '', '교육정보부', '코딩 경진대회', ''),
+  ];
+  const parts = [];
+  events.filter(e => e.대상 !== '전체').forEach(e => {
+    const gr = gradesOf(e);
+    students.filter(s => !gr.length || gr.includes(s.학년)).forEach(s => { if (rnd() < 0.18) parts.push({ 행사id: e.id, 학번: s.학번, 비고: '', 등록자: '예시', 등록일시: '' }); });
+  });
+  return { events, students, parts };
+}
+
+/* ---------- 시작 ---------- */
+(async function start() {
+  const saved = store.get('login') || {};
+  if (saved.code) {
+    S.user = saved.user || ''; S.code = saved.code;
+    try { await reload(); return renderApp(); } catch (e) { /* 코드가 바뀌었으면 로그인 화면으로 */ }
+  }
+  renderLogin();
+})();
