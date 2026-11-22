@@ -3,7 +3,8 @@
 
 const CFG = window.APP_CONFIG || {};
 const API_URL = String(CFG.API_URL || '').trim();
-const DEMO = !API_URL;
+const GAS = typeof google !== 'undefined' && google.script && google.script.run; // 구글 Apps Script 안에서 실행 중
+const DEMO = !API_URL && !GAS;
 const SCHOOL = CFG.SCHOOL_NAME || '우리 학교';
 const CATS = ['자율', '동아리', '봉사', '진로', '종합', '수상', '기타'];
 const EV_FIELDS = ['id','학년도','행사명','분류','대상','학년','시작일','종료일','주관부서','활동내용','생기부문구','비고','수정자','수정일시'];
@@ -138,6 +139,12 @@ const targetLabel = e => (gradesOf(e).length ? gradesOf(e).join('·') + '학년 
 async function call(action, payload = {}) {
   const body = { action, code: S.code, user: S.user, ...payload };
   if (DEMO) return Demo.call(body);
+  if (GAS) return new Promise((resolve, reject) => {
+    google.script.run
+      .withSuccessHandler(txt => { const j = JSON.parse(txt); j.ok ? resolve(j) : reject(new Error(j.error || '오류가 발생했습니다.')); })
+      .withFailureHandler(e => reject(new Error((e && e.message) || '서버 오류가 발생했습니다.')))
+      .api(body);
+  });
   let res;
   try {
     res = await fetch(API_URL, { method: 'POST', body: JSON.stringify(body) }); // text/plain → CORS 사전요청 없음
@@ -162,7 +169,7 @@ function renderLogin(err = '') {
       <h2>학교 행사 참여 기록</h2>
       <div class="muted small">${esc(SCHOOL)}</div>
       <label for="lgName">이름</label>
-      <input type="text" id="lgName" value="${esc(saved.user || '')}" placeholder="예: 김선생" autocomplete="name" required>
+      <input type="text" id="lgName" value="${esc(S.user || saved.user || '')}" placeholder="예: 김선생" autocomplete="name" required>
       <label for="lgCode">접속 코드</label>
       <input type="password" id="lgCode" placeholder="조회 코드 또는 편집 코드" required>
       ${DEMO ? '<div class="muted small" style="margin-top:6px">체험용 코드: 편집 <code>edit</code> · 조회 <code>view</code></div>' : ''}
@@ -193,7 +200,7 @@ function renderApp() {
   const canEdit = S.role === 'edit';
   const years = uniq([...IX.years, S.year]).sort().reverse();
   $('#app').innerHTML = `
-    ${DEMO ? '<div class="demo-bar">체험 모드 — 예시 데이터입니다. 실제 사용은 config.js에 API 주소를 넣으세요.</div>' : ''}
+    ${DEMO ? '<div class="demo-bar">체험 모드 — 예시 데이터입니다. 실제 사용은 README의 설치 방법을 따라 주세요.</div>' : ''}
     <header class="top"><div class="top-in">
       <div class="brand">행사 참여 기록<small>${esc(SCHOOL)}</small></div>
       <select id="yearSel" aria-label="학년도">${years.map(y => `<option value="${y}" ${y === S.year ? 'selected' : ''}>${y}학년도</option>`).join('')}</select>
