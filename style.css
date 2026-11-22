@@ -139,13 +139,13 @@ code{background:#f0f2f5;border-radius:4px;padding:1px 5px;font-size:13px}
 #print{display:none}
 @media print{
   body>*:not(#print){display:none!important}
-  #print{display:block;font-size:11pt}
+  #print{display:block;font-size:9.5pt;line-height:1.4}
   .p-page{page-break-after:always}
   .p-page:last-child{page-break-after:auto}
-  .p-page h1{font-size:15pt;margin:0 0 4px}
-  .p-page table{font-size:10pt}
-  .p-page th{background:#eee;position:static}
-  .p-page td,.p-page th{border:1px solid #999;padding:4px 6px}
+  .p-page h1{font-size:13pt;margin:0 0 4px}
+  .p-page table{font-size:8.5pt}
+  .p-page th{background:#eee;position:static;font-size:8.5pt}
+  .p-page td,.p-page th{border:1px solid #999;padding:3px 5px}
 }
 
 @media (max-width:860px){
