@@ -334,8 +334,8 @@ function printStudents(list) {
     return `<div class="p-page">
       <h1>${esc(st.학년도)}학년도 창의적 체험활동 참여 기록</h1>
       <p>${esc(st.학년)}학년 ${esc(st.반)}반 ${esc(st.번호)}번 ${esc(st.이름)} (학번 ${esc(st.학번)}) · 참여 ${evs.length}건</p>
-      <table><thead><tr><th>#</th><th>행사명</th><th>분류</th><th>기간</th><th>주관</th><th>생기부 문구</th></tr></thead><tbody>
-      ${evs.map((e, i) => `<tr><td>${i + 1}</td><td>${esc(e.행사명)}</td><td>${esc(e.분류)}</td><td>${esc(period(e))}</td><td>${esc(e.주관부서)}</td><td style="white-space:pre-wrap">${esc(e.생기부문구)}</td></tr>`).join('')}
+      <table><thead><tr><th>#</th><th>행사명</th><th>분류</th><th>기간</th><th>주관</th><th>생기부 문구</th><th class="p-note">비고</th></tr></thead><tbody>
+      ${evs.map((e, i) => `<tr><td>${i + 1}</td><td>${esc(e.행사명)}</td><td>${esc(e.분류)}</td><td>${esc(period(e))}</td><td>${esc(e.주관부서)}</td><td style="white-space:pre-wrap">${esc(e.생기부문구)}</td><td class="p-note" style="white-space:pre-wrap">${esc(e.비고)}</td></tr>`).join('')}
       </tbody></table></div>`;
   }).join('');
   window.print();
