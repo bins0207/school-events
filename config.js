@@ -7,5 +7,5 @@ window.APP_CONFIG = {
 
   // Apps Script 웹 앱 주소 (https://script.google.com/macros/s/AKfycbzx8LODWIEwWviXqFB0r5wWkk_2Rp72e_gOG-IkBopBPRN7YzMhDFf2b2gAoVXZDxeg/exec)
   // 비워 두면 '체험 모드'로 실행되어 예시 데이터로 사용해 볼 수 있습니다.
-  API_URL: "",
+  API_URL: "https://script.google.com/macros/s/AKfycbzx8LODWIEwWviXqFB0r5wWkk_2Rp72e_gOG-IkBopBPRN7YzMhDFf2b2gAoVXZDxeg/exec",
 };
