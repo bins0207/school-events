@@ -485,7 +485,7 @@ function renderPP() {
       </div>
       <div>
         <div class="small muted">학번 붙여넣기 (엑셀에서 열을 복사해 붙여도 됩니다)</div>
-        <textarea id="pPaste" rows="5" placeholder="10107&#10;10123 10125&#10;…"></textarea>
+        <textarea id="pPaste" rows="5" placeholder="1107&#10;1123 1125&#10;…"></textarea>
         <div class="row" style="margin-top:6px">
           <button class="btn sm" id="pAdd">추가</button>
           <button class="btn sm" id="pRemove">빼기</button>
@@ -557,12 +557,12 @@ function renderData() {
       <div class="card">
         <h2>학생 명단 올리기</h2>
         ${canEdit ? `
-        <p class="muted small">엑셀에서 <b>학번, 이름</b> 열을 복사해 붙여 넣으세요. (제목줄이 있으면 학년·반·번호 열도 인식합니다.) 학년·반·번호가 없으면 학번 <code>10107</code> → 1학년 1반 7번으로 계산합니다.</p>
+        <p class="muted small">엑셀에서 <b>학번, 이름</b> 열을 복사해 붙여 넣으세요. (제목줄이 있으면 학년·반·번호 열도 인식합니다.) 학년·반·번호가 없으면 학번 <code>1107</code> → 1학년 1반 7번으로 계산합니다. (다섯 자리 <code>10107</code>도 인식합니다.)</p>
         <div class="row" style="margin-bottom:6px">
           <label class="small">학년도 <input type="number" id="sYear" value="${esc(S.year)}" style="width:90px"></label>
           <input type="file" id="sFile" accept=".csv,.tsv,.txt">
         </div>
-        <textarea id="sPaste" rows="6" placeholder="학번&#9;이름&#10;10101&#9;홍길동&#10;10102&#9;김철수"></textarea>
+        <textarea id="sPaste" rows="6" placeholder="학번&#9;이름&#10;1101&#9;홍길동&#10;1102&#9;김철수"></textarea>
         <div class="preview" id="sPrev"></div>
         <div class="row" style="margin-top:8px">
           <label class="row small"><input type="radio" name="sMode" value="append" checked> 추가·고치기</label>
@@ -668,8 +668,8 @@ function parseEvents(text) {
 /* ---------- 체험 모드 (API 주소가 없을 때) ---------- */
 const Demo = {
   db: null,
-  load() { this.db = store.get('demo-db-v1') || makeDemoData(); },
-  save() { store.set('demo-db-v1', this.db); },
+  load() { this.db = store.get('demo-db-v2') || makeDemoData(); },
+  save() { store.set('demo-db-v2', this.db); },
   async call(b) {
     if (!this.db) this.load();
     await new Promise(r => setTimeout(r, 120));
@@ -717,7 +717,7 @@ function makeDemoData() {
   const giv = ['민준', '서연', '도윤', '하은', '시우', '지유', '주원', '서윤', '하준', '지민', '예준', '수아', '건우', '채원', '현우', '지아', '우진', '다은', '선우', '예린', '유찬', '소율', '은호', '하린'];
   const Y = curSchoolYear(); const students = [];
   for (let g = 1; g <= 3; g++) for (let c = 1; c <= 4; c++) for (let n = 1; n <= 24; n++)
-    students.push({ 학년도: Y, 학번: `${g}${String(c).padStart(2, '0')}${String(n).padStart(2, '0')}`, 학년: String(g), 반: String(c), 번호: String(n), 이름: pick(sur) + pick(giv) });
+    students.push({ 학년도: Y, 학번: `${g}${c}${String(n).padStart(2, '0')}`, 학년: String(g), 반: String(c), 번호: String(n), 이름: pick(sur) + pick(giv) });
   const ev = (name, cat, tgt, gr, s, e, dept, act, memo) => ({ id: Y + '-' + name.length + Math.floor(rnd() * 1e6), 학년도: Y, 행사명: name, 분류: cat, 대상: tgt, 학년: gr, 시작일: `${Y}-${s}`, 종료일: e ? `${Y}-${e}` : '', 주관부서: dept, 활동내용: act, 생기부문구: memo, 비고: '', 수정자: '예시', 수정일시: '' });
   const events = [
     ev('학교폭력예방 교육', '자율', '전체', '', '03-27', '', '학생생활안전부', '사이버폭력 예방 영상 시청 및 소감문 작성', '학교폭력예방 교육에 참여하여 사이버폭력의 유형과 대처 방법을 익힘.'),
