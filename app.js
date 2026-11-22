@@ -363,7 +363,7 @@ function renderEvents() {
         ${canEdit ? '<button class="btn pri" id="eNew">+ 새 행사</button>' : ''}
       </div>
       <div class="tbl-wrap"><table>
-        <thead><tr><th>기간</th><th>행사명</th><th>분류</th><th>대상</th><th>주관부서</th><th class="num">참여</th><th>최근 수정</th></tr></thead>
+        <thead><tr><th>기간</th><th>행사명</th><th>분류</th><th>대상</th><th>주관부서</th><th class="num">참여</th><th>비고</th><th>최근 수정</th></tr></thead>
         <tbody id="eBody"></tbody>
       </table></div>
     </div>`;
@@ -378,8 +378,9 @@ function renderEvents() {
         <td class="small">${esc(targetLabel(e))}</td>
         <td class="small">${esc(e.주관부서)}</td>
         <td class="num">${partCount(e)}명</td>
+        <td class="small" style="max-width:220px;white-space:pre-wrap">${esc(e.비고)}</td>
         <td class="small muted">${esc(e.수정자)}${e.수정일시 ? '<br>' + esc(e.수정일시) : ''}</td>
-      </tr>`).join('') || `<tr><td colspan="7" class="empty">${S.year}학년도 행사가 없습니다.</td></tr>`;
+      </tr>`).join('') || `<tr><td colspan="8" class="empty">${S.year}학년도 행사가 없습니다.</td></tr>`;
     $$('#eBody tr.click').forEach(tr => tr.onclick = () => openEvent(S.db.events.find(e => e.id === tr.dataset.id)));
   };
   $('#eQ').oninput = e => { S.ef.q = e.target.value; draw(); };
